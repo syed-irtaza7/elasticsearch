@@ -64,7 +64,7 @@ import java.util.TreeSet;
  * Pushes the labels of a translated PromQL plan down into columns, right after {@link TranslatePromqlToEsqlPlan}.
  * <p>
  * Translation carries the labels of a series as one label container ({@code _timeseries}) and states every label operation as a
- * call over it: {@link TimeSeriesMetadataFilter} leaves labels out, {@link TimeSeriesMetadataFilter} keeps some, {@link TimeSeriesMetadataSet} writes one
+ * call over it: {@link TimeSeriesMetadataFilter} keeps some labels or leaves them out, {@link TimeSeriesMetadataSet} writes one
  * and {@link TimeSeriesMetadataPath} reads one; aggregations, joins, unions and hashing compare containers as a whole. Comparing and
  * rewriting whole containers is slow, and a node before 9.7 cannot read the typed container at all. This rule splits each container
  * into columns instead: a residual container, which the source reads as a view leaving out the labels the plan removes or writes,
@@ -107,7 +107,9 @@ public final class PushDownPromqlLabels extends ParameterizedRule<LogicalPlan, L
 
     /** The source's label container, as translation reads it: every label of the series. */
     static boolean isSource(Expression expression) {
-        return expression instanceof ToTimeSeriesMetadata cast && cast.field() instanceof TimeSeriesWithout without && without.children().isEmpty();
+        return expression instanceof ToTimeSeriesMetadata cast
+            && cast.field() instanceof TimeSeriesWithout without
+            && without.children().isEmpty();
     }
 
     /** The label names a {@code ts_*} call lists after its container. */
@@ -221,9 +223,8 @@ public final class PushDownPromqlLabels extends ParameterizedRule<LogicalPlan, L
             int root = find(cls);
             expression.forEachDown(e -> {
                 switch (e) {
-                    case TimeSeriesMetadataFilter unset when unset.exclude() -> removed.get(root).addAll(names(unset.children().subList(1, unset.children().size())));
+                    case TimeSeriesMetadataFilter filter -> (filter.exclude() ? removed : read).get(root).addAll(names(filter.labels()));
                     case TimeSeriesMetadataSet set -> removed.get(root).addAll(names(List.of(set.label())));
-                    case TimeSeriesMetadataFilter keep when keep.exclude() == false -> read.get(root).addAll(names(keep.children().subList(1, keep.children().size())));
                     case TimeSeriesMetadataPath get -> read.get(root).addAll(names(get.children().subList(1, 2)));
                     default -> {
                     }
@@ -839,16 +840,9 @@ public final class PushDownPromqlLabels extends ParameterizedRule<LogicalPlan, L
                 case Expression e when isSource(e) -> sourceShape();
                 case ToTimeSeriesMetadata cast when cast.field() instanceof Literal -> Shape.empty();
                 case Literal literal when literal.value() == null -> Shape.empty();
-                case TimeSeriesMetadataFilter unset when unset.exclude() -> without(
-                    shape(unset.labelContainer()),
-                    source,
-                    names(unset.children().subList(1, unset.children().size()))
-                );
-                case TimeSeriesMetadataFilter keep when keep.exclude() == false -> keep(
-                    shape(keep.labelContainer()),
-                    source,
-                    names(keep.children().subList(1, keep.children().size()))
-                );
+                case TimeSeriesMetadataFilter filter -> filter.exclude()
+                    ? without(shape(filter.labelContainer()), source, names(filter.labels()))
+                    : keep(shape(filter.labelContainer()), source, names(filter.labels()));
                 case TimeSeriesMetadataSet set -> with(
                     shape(set.labelContainer()),
                     source,
@@ -911,8 +905,9 @@ public final class PushDownPromqlLabels extends ParameterizedRule<LogicalPlan, L
                 : new TimeSeriesMetadataFilter(
                     Source.EMPTY,
                     view.rest(),
-                    left.stream().<Expression>map(l -> Literal.keyword(Source.EMPTY, l)).toList()
-                , true);
+                    left.stream().<Expression>map(l -> Literal.keyword(Source.EMPTY, l)).toList(),
+                    true
+                );
         }
 
         private Expression get(Shape shape, Source source, String label) {
@@ -968,8 +963,9 @@ public final class PushDownPromqlLabels extends ParameterizedRule<LogicalPlan, L
             return new TimeSeriesMetadataFilter(
                 source,
                 shape.rest(),
-                left.stream().<Expression>map(name -> Literal.keyword(source, name)).toList()
-            , true);
+                left.stream().<Expression>map(name -> Literal.keyword(source, name)).toList(),
+                true
+            );
         }
 
         /** The parts in a fixed order: the residual container, if any, then the labels by name. */

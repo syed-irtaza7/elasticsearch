@@ -144,8 +144,7 @@ public final class Alias extends NamedExpression {
                     synthetic(),
                     AnalyzedTextExpression.valuesAnalyzerOf(child)
                 )
-                // Preserve id so union/project pins rematch after Bind resolves the child.
-                : new UnresolvedAttribute(source(), name(), id(), null);
+                : new UnresolvedAttribute(source(), name());
         }
         return lazyAttribute;
     }

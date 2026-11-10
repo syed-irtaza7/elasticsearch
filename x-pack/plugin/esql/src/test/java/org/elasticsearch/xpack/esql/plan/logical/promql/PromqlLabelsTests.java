@@ -7,33 +7,49 @@
 
 package org.elasticsearch.xpack.esql.plan.logical.promql;
 
+import org.elasticsearch.index.IndexMode;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.xpack.esql.EsqlTestUtils;
+import org.elasticsearch.xpack.esql.core.expression.Attribute;
+import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
+import org.elasticsearch.xpack.esql.core.tree.Source;
+import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.core.type.EsField;
+import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
 
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
 
-/** The labels a PromQL node's residual label container leaves out, as its output declares them. */
+import static org.hamcrest.Matchers.nullValue;
+import static org.hamcrest.Matchers.sameInstance;
+
+/** How PromQL finds a label among the fields of its source and among a node's declared output. */
 public class PromqlLabelsTests extends ESTestCase {
 
-    /** A label name may contain the separator, so leaving out {@code a$b} differs from leaving out {@code a} and {@code b}. */
-    public void testLabelContainerViewNamesAreDistinct() {
-        List<Set<String>> views = List.of(
-            Set.of(),
-            Set.of("a"),
-            Set.of("b"),
-            Set.of("a", "b"),
-            Set.of("a$b"),
-            Set.of("a\\"),
-            Set.of("a\\", "b"),
-            Set.of("a\\$b"),
-            Set.of("$"),
-            Set.of("$", "a")
-        );
-        var names = new HashSet<String>();
-        for (Set<String> view : views) {
-            assertTrue(view.toString(), names.add(PromqlLabels.labelContainerName(view)));
-        }
-        assertEquals("_timeseries$pod", PromqlLabels.labelContainerName(Set.of("pod")));
+    private final FieldAttribute pod = field("pod", EsField.TimeSeriesFieldType.DIMENSION);
+    private final FieldAttribute event = field("event", EsField.TimeSeriesFieldType.NONE);
+    private final EsRelation relation = EsqlTestUtils.relation(IndexMode.TIME_SERIES).withAttributes(List.of(pod, event));
+
+    /** Any field of a series is one of its labels, but only a dimension identifies the series. */
+    public void testFieldIsALabelDimensionOrNot() {
+        assertThat(PromqlLabels.getField(relation, "event"), sameInstance(event));
+        assertThat(PromqlLabels.getLabel(relation, "event"), nullValue());
+        assertThat(PromqlLabels.getLabel(relation, "pod"), sameInstance(pod));
+        assertThat(PromqlLabels.getField(relation, "missing"), nullValue());
+    }
+
+    /** The tags label stands for every label a node does not declare by name. */
+    public void testTagsLabelAmongDeclaredLabels() {
+        UnresolvedPromqlLabelRef tags = UnresolvedPromqlLabelRef.newTagsLabel(Source.EMPTY);
+        UnresolvedPromqlLabelRef cluster = UnresolvedPromqlLabelRef.label(Source.EMPTY, "cluster");
+        List<Attribute> declared = List.of(cluster, tags);
+        assertThat(PromqlLabels.getTagsLabel(declared), sameInstance(tags));
+        assertTrue(PromqlLabels.isTagsLabel(tags));
+        assertFalse(PromqlLabels.isTagsLabel(cluster));
+        assertThat(PromqlLabels.getTagsLabel(List.of(cluster)), nullValue());
+    }
+
+    private static FieldAttribute field(String name, EsField.TimeSeriesFieldType type) {
+        return new FieldAttribute(Source.EMPTY, name, new EsField(name, DataType.KEYWORD, Map.of(), true, type));
     }
 }

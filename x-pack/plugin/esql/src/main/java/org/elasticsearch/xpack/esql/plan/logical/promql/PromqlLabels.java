@@ -10,15 +10,11 @@ package org.elasticsearch.xpack.esql.plan.logical.promql;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
-import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
 import org.elasticsearch.xpack.esql.core.expression.TimeSeriesMetadataAttribute;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 
 import java.util.List;
-import java.util.Set;
-import java.util.TreeSet;
-import java.util.stream.Collectors;
 
 /**
  * Shared naming conventions for PromQL labels represented as ES|QL fields.
@@ -53,27 +49,19 @@ public final class PromqlLabels {
         return name.startsWith(PROMETHEUS_LABELS_PREFIX) ? name.substring(PROMETHEUS_LABELS_PREFIX.length()) : name;
     }
 
-    /** labels container the plan does not promote, or null when every label is promoted. */
-    public static @Nullable UnresolvedPromqlLabelRef labelContainer(List<Attribute> labels) {
-        for (var a : labels) {
-            if (isLabelContainer(a) && a instanceof UnresolvedPromqlLabelRef ua) {
-                return ua;
+    /** The tags label among {@code labels}: the label container holding every label they do not declare, or null. */
+    public static @Nullable UnresolvedPromqlLabelRef getTagsLabel(List<Attribute> labels) {
+        for (Attribute label : labels) {
+            if (label instanceof UnresolvedPromqlLabelRef reference && reference.isTagsLabel()) {
+                return reference;
             }
         }
         return null;
     }
 
-    /** Whether the label is _timeseries label container */
-    public static boolean isLabelContainer(Attribute label) {
-        return label instanceof UnresolvedPromqlLabelRef reference && reference.isLabelContainer();
-    }
-
-    /** Column name for the label container after applying unset (e.g. _timeseries$pod after without(pod)). */
-    public static String labelContainerName(Set<String> unset) {
-        String suffix = new TreeSet<>(unset).stream()
-            .map(label -> label.replace("\\", "\\\\").replace("$", "\\$"))
-            .collect(Collectors.joining("$"));
-        return MetadataAttribute.TIMESERIES + (unset.isEmpty() ? "" : "$" + suffix);
+    /** Whether {@code label} is the tags label: the label container holding every label not declared beside it. */
+    public static boolean isTagsLabel(Attribute label) {
+        return label instanceof UnresolvedPromqlLabelRef reference && reference.isTagsLabel();
     }
 
     /**
