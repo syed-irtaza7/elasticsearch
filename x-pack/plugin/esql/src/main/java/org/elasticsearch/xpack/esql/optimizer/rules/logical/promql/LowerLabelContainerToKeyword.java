@@ -38,7 +38,7 @@ import java.util.Set;
  * Temporary compatibility for nodes before 9.7, which cannot read the typed label container: lowers it in a translated PromQL
  * plan to the keyword {@code _timeseries} whenever such a node participates ({@link PromqlCommand#usesLabelContainer}).
  * <p>
- * Translation and {@link ResolvePromqlLabelRefs} produce one representation: the series read their label container as keyword
+ * Translation and {@link PushDownPromqlLabels} produce one representation: the series read their label container as keyword
  * views of the source, cast to a typed label container above the collapse ({@link ToTimeSeriesMetadata}). The keyword form is that plan
  * without the casts: each view is the keyword column it was cast from, and the label container of a series without labels is
  * null. What has no keyword form fails: reading a label out of the label container, or leaving labels out of it after the collapse
