@@ -122,6 +122,7 @@ required_capability: ts_collapse
 required_capability: fix_promql_time_bucket_v2
 required_capability: fix_tstep_bucket_rounding
 required_capability: fix_ts_block_loader_passthrough_aliasing
+required_capability: enable_tsmd_data_type
 PROMQL index=prometheus-k8s step=1m start="2024-05-10T00:02:00.000Z" end="2024-05-10T00:04:00.000Z" clients=(last_over_time(network.eth0.currently_connected_clients{cluster="staging"}[1m]) or last_over_time(network.eth0.currently_connected_clients{cluster="staging"}[5m]))
 | TS_COLLAPSE
 | EVAL step = TO_LONG(step)
