@@ -25,14 +25,12 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * A label of a translated PromQL plan, not yet bound to a column: a promoted label by name, or the _timeseries
- * label container holding every label not promoted. Translation emits these so Bind can resolve without depending on
- * which columns the input already carries.
+ * A label in the declared output of a PromQL node, before translation: a label by name, or the _timeseries label container
+ * holding every label not declared. The analyzer resolves the command's output against these; translation itself reads labels
+ * off one label container.
  * <p>
- * A label container reference's unset is the transform its operator applies to an input label container: labels dropped from the
- * blob (without(...), label_replace destination, arith dropping __name__, ...). ResolvePromqlLabelRefs accumulates those into
- * the against-source view that names the column. Leaving labels out requires typed {@code _timeseries}
- * ({@code ts_transform}); a keyword label container does not support that.
+ * A label container reference's unset is what the node leaves out of its input's label container: labels dropped from it
+ * (without(...), label_replace destination, arith dropping __name__, ...).
  */
 public final class UnresolvedPromqlLabelRef extends Attribute implements Unresolvable {
 
