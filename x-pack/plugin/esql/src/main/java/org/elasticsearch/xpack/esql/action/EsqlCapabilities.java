@@ -4197,6 +4197,13 @@ public class EsqlCapabilities {
         FIX_PROMQL_TOPK_OVER_AGGREGATE,
 
         /**
+         * Fix PromQL {@code topk()} over an aggregate without labels (e.g. {@code topk(k, sum(...))}): the aggregate already holds
+         * one series per step, so the reduction ranks its rows as they are instead of failing with
+         * {@code can't find input for [value]}.
+         */
+        FIX_PROMQL_TOPK_OVER_UNLABELED_AGGREGATE,
+
+        /**
          * Support for the PromQL {@code label_replace} and {@code label_join} metadata-manipulation functions, when the
          * derived destination label is consumed by an enclosing {@code by(...)} aggregation. The destination may be a new
          * label or may overwrite a stored label (a dimension or {@code __name__}).

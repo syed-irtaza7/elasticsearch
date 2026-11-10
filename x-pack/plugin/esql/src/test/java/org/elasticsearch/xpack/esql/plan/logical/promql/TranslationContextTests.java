@@ -51,7 +51,7 @@ public class TranslationContextTests extends ESTestCase {
         Attribute step = new ReferenceAttribute(Source.EMPTY, "step", DataType.DATETIME);
         Attribute value = new ReferenceAttribute(Source.EMPTY, "value", DataType.DOUBLE);
         var plan = new LocalRelation(Source.EMPTY, List.of(step, value), EmptyLocalSupplier.EMPTY);
-        var result = new IntermediateResult(plan, value, step, Literal.TRUE, IntermediateResult.Kind.BEFORE_INITIAL_AGGREGATE);
+        var result = new IntermediateResult(plan, value, null, step, Literal.TRUE, IntermediateResult.Kind.BEFORE_INITIAL_AGGREGATE);
 
         var updatedValue = new Literal(Source.EMPTY, 42.0, DataType.DOUBLE);
         var updated = result.with(plan, updatedValue);

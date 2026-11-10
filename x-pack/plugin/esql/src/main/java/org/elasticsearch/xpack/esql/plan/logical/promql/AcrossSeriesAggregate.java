@@ -7,6 +7,7 @@
 
 package org.elasticsearch.xpack.esql.plan.logical.promql;
 
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.xpack.esql.core.capabilities.Resolvables;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
@@ -143,6 +144,26 @@ public final class AcrossSeriesAggregate extends PromqlFunctionCall {
     }
 
     /** Labels this without(...) drops from the label container (listed labels + __name__, even if the list is empty). */
+    /**
+     * The labels of a group: {@code without(...)} leaves the listed labels and the metric name out, {@code by(...)} keeps
+     * only the listed labels; a group without labels has none.
+     */
+    private @Nullable Expression groupLabels(@Nullable Expression input) {
+        if (input == null) {
+            return null;
+        }
+        if (grouping == WITHOUT) {
+            return TranslationContext.unset(input, dropping());
+        }
+        List<String> kept = labelNames(
+            groupings.stream()
+                .filter(a -> a.resolved() && a.dataType() != DataType.NULL)
+                .filter(not(a -> a instanceof FieldAttribute fa && fa.isMetric()))
+                .toList()
+        );
+        return kept.isEmpty() ? null : TranslationContext.keep(input, kept);
+    }
+
     private List<String> dropping() {
         List<String> labels = labelNames(groupings);
         if (labels.contains(LabelMatcher.NAME)) {
@@ -184,10 +205,10 @@ public final class AcrossSeriesAggregate extends PromqlFunctionCall {
         Expression function = buildEsqlFunction(ir.value(), promqlCtx);
 
         // A raw operand collapses once, with the operator's function fused into the per-series aggregate; a table regroups.
-        List<Attribute> keys = UnresolvedPromqlLabelRef.tsIdentity(source(), output());
+        Expression labels = groupLabels(ir.labels());
         IntermediateResult result = ir.kind().afterInitialAggregation
-            ? ctx.emitAggregate(ir, keys, grouping == WITHOUT, function)
-            : ctx.emitInitialAggregate(ir, keys, function);
+            ? ctx.emitAggregate(ir, labels, function)
+            : ctx.emitInitialAggregate(ir, labels, function);
         // A count is at least 1 for an element. A group none of whose series has a value - every series of an operator
         // left without a partner, say - is no element in Prometheus, not a count of 0.
         if (function instanceof Count) {

@@ -173,6 +173,15 @@ public abstract sealed class PromqlFunctionCall extends UnaryPlan implements Pro
             window = context.cmd().resolveRangeWindow(rangeSelector.range());
         }
         var promqlCtx = new PromqlContext(context.time(), window, child.step(), context.configuration(), context.cmd().timestamp());
-        return context.eval(child, TranslationContext.emptyRangeAsNull(buildEsqlFunction(child.value(), promqlCtx), context.time()));
+        IntermediateResult result = context.eval(
+            child,
+            TranslationContext.emptyRangeAsNull(buildEsqlFunction(child.value(), promqlCtx), context.time())
+        );
+        return child.labels() == null ? result : result.withLabels(labels(child.labels()));
+    }
+
+    /** What the function does to the labels of its input series; the result keeps them unless a function says otherwise. */
+    protected Expression labels(Expression input) {
+        return input;
     }
 }

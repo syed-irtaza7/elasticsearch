@@ -109,8 +109,8 @@ public final class LiteralSelector extends Selector {
         if (foldedPlan != null) {
             // a compile-time relation carries its own step column
             Attribute foldedStep = PromqlLabels.getLabel(foldedPlan.output(), context.cmd().stepColumnName());
-            return new IntermediateResult(foldedPlan, literal, foldedStep, matcher, Kind.CONSTANT);
+            return new IntermediateResult(foldedPlan, literal, null, foldedStep, matcher, Kind.CONSTANT);
         }
-        return new IntermediateResult(input, literal, context.stepAttr(), matcher);
+        return new IntermediateResult(input, literal, null, context.stepAttr(), matcher);
     }
 }

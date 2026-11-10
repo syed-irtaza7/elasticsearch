@@ -118,6 +118,6 @@ public final class ScalarFunction extends LeafPlan implements PromqlPlan {
     public IntermediateResult translate(TranslationContext context) {
         Attribute step = context.cmd().stepAttribute().withId(context.stepAttr().id());
         var function = buildEsqlFunction(new PromqlContext(context.cmd().timestamp(), null, step, context.configuration()));
-        return new IntermediateResult(context.cmd().child(), function, context.stepAttr());
+        return new IntermediateResult(context.cmd().child(), function, null, context.stepAttr(), null);
     }
 }

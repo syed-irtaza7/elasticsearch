@@ -94,9 +94,12 @@ public final class ValueTransformationFunction extends PromqlFunctionCall {
 
     @Override
     public IntermediateResult translate(TranslationContext context) {
-        // Name drop is declared in {@link #output()}; union branches project that unset onto a shared
-        // {@code _timeseries} alias so tracing omits {@code __name__} without an Eval statement that would
-        // break rate/sum aggregate fusion.
         return translateValueFunction(context);
+    }
+
+    /** Prometheus drops the metric name from value transforms (ceil, abs, ...). */
+    @Override
+    protected Expression labels(Expression input) {
+        return TranslationContext.unset(input, List.of(LabelMatcher.NAME));
     }
 }

@@ -163,7 +163,7 @@ import org.elasticsearch.xpack.esql.optimizer.rules.logical.TranslateTimeSeriesA
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.TranslateTimeSeriesWithout;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.AddPromqlResultOrder;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.LowerLabelContainerToKeyword;
-import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.ResolvePromqlLabelRefs;
+import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PushDownPromqlLabels;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslatePromqlToEsqlPlan;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslateTimeSeriesCollapse;
 import org.elasticsearch.xpack.esql.optimizer.rules.physical.local.LucenePushdownPredicates;
@@ -338,9 +338,8 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
                 new AddPromqlResultOrder(),
                 // translate PromQL plan to ESQL. It should run before TranslateTimeSeriesAggregate and implicit casting
                 new TranslatePromqlToEsqlPlan(),
-                // Binds the labels the translated plan reads to the columns producing them. ResolveAndVerifyPromqlRefs
-                // resolves the references of the PromQL command itself, before translation.
-                new ResolvePromqlLabelRefs(),
+                // Splits the translated plan's label containers into a residual container and a column per label it names.
+                new PushDownPromqlLabels(),
                 // Where a participating node reads only keyword _timeseries, the typed label container of the bound plan goes keyword.
                 new LowerLabelContainerToKeyword()
             ),

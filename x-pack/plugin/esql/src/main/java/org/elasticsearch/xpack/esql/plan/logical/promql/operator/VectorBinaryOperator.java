@@ -8,11 +8,13 @@
 package org.elasticsearch.xpack.esql.plan.logical.promql.operator;
 
 import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.xpack.esql.core.expression.Alias;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.expression.Literal;
+import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
 import org.elasticsearch.xpack.esql.core.expression.NameId;
 import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
@@ -25,14 +27,12 @@ import org.elasticsearch.xpack.esql.expression.function.aggregate.AggregateFunct
 import org.elasticsearch.xpack.esql.expression.function.aggregate.TimeSeriesAggregateFunction;
 import org.elasticsearch.xpack.esql.expression.function.scalar.conditional.Case;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToDouble;
-import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.Equals;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.TemporaryNameGenerator;
 import org.elasticsearch.xpack.esql.plan.logical.Aggregate;
 import org.elasticsearch.xpack.esql.plan.logical.BinaryPlan;
 import org.elasticsearch.xpack.esql.plan.logical.Eval;
 import org.elasticsearch.xpack.esql.plan.logical.Filter;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
-import org.elasticsearch.xpack.esql.plan.logical.PackDims;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
 import org.elasticsearch.xpack.esql.plan.logical.TimeSeriesAggregate;
 import org.elasticsearch.xpack.esql.plan.logical.TopNBy;
@@ -66,7 +66,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.TreeSet;
 import java.util.stream.Collectors;
 
 import static org.elasticsearch.xpack.esql.expression.function.aggregate.AggregateFunction.withFilter;
@@ -86,7 +85,13 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
      * One side of the join after PackDims (and optional layout pin): plan, match fields, step, and value column on
      * that plan.
      */
-    private record Input(LogicalPlan plan, List<Attribute> fields, Attribute step, Attribute valueColumn) {}
+       /** One side of a join: its plan, the fields it joins on (step and signature), and its value and label columns. */
+    private record Input(LogicalPlan plan, List<Attribute> fields, Attribute step, Attribute valueColumn, @Nullable Attribute labels) {}
+
+    /** The join's signature column on either side. */
+    private static final String SIGNATURE = "$prom_sig";
+    /** The one side's labels carried across a group_x join, named apart from the many side's. */
+    private static final String ONE_LABELS = "$prom_one";
 
     /**
      * Underlying binary operation (e.g. +, -, *, /, etc.) being performed
@@ -538,13 +543,16 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
         // of two aggregates has no UnionAll here ({@link #frame} refuses it), so this does not collapse two values.
         if (kind.afterInitialAggregation && plan.anyMatch(UnionAll.class::isInstance)) {
             IntermediateResult vector = left.kind().afterInitialAggregation ? left : right;
-            IntermediateResult pinned = pinOperandLayout(context, new IntermediateResult(plan, vector.value(), step, filter, kind));
+            IntermediateResult pinned = pinOperandLayout(
+                context,
+                new IntermediateResult(plan, vector.value(), vector.labels(), step, filter, kind)
+            );
             plan = pinned.plan();
             step = pinned.step();
             if (left.kind().afterInitialAggregation) {
-                left = left.with(plan, pinned.value());
+                left = left.with(plan, pinned.value()).withLabels(pinned.labels());
             } else {
-                right = right.with(plan, pinned.value());
+                right = right.with(plan, pinned.value()).withLabels(pinned.labels());
             }
         }
 
@@ -555,7 +563,8 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
             plan = new Filter(source(), plan, binaryExpr);
             binaryExpr = leftExpr;
         }
-        IntermediateResult result = new IntermediateResult(plan, null, step, filter, kind);
+        IntermediateResult vector = PromqlPlan.returnsScalar(left()) ? right : left;
+        IntermediateResult result = new IntermediateResult(plan, null, resultLabels(vector.labels(), null), step, filter, kind);
         return context.eval(result, binaryExpr);
     }
 
@@ -568,7 +577,7 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
      */
     private record Frame(TimeSeriesAggregate aggregate, List<Eval> evals, Expression filter, boolean acrossSeries) {
         boolean sharesGrainWith(Frame other) {
-            return acrossSeries == other.acrossSeries && groupingNames(aggregate).equals(groupingNames(other.aggregate));
+            return acrossSeries == other.acrossSeries && sameLabels(aggregate, other.aggregate);
         }
     }
 
@@ -644,7 +653,7 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
             List.of(build.valueColumn()),
             false
         );
-        return bindResult(context, leftValue, rightValue, probe.step(), join, bindOutput(context, dropMetricNameFromRest(output())));
+        return bindResult(context, leftValue, rightValue, probe.step(), join, resultLabels(probe.labels(), null));
     }
 
     /**
@@ -678,24 +687,60 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
         if (PromqlPlan.returnsScalar(left()) || PromqlPlan.returnsScalar(right())) {
             return translateAsBroadcastJoin(context, left, right);
         }
-        VectorMatch match = match();
-        // No on/ignoring: concrete operands pack their named labels; opaque ones pack the label container excluding __name__
-        // (Prometheus default matching is implicit ignoring(__name__)).
-        List<Attribute> declared = dropMetricNameFromRest(output());
-        // Orientation: the probe side keeps its identities; the build side is re-identified so a self-join of
-        // structurally identical operands has distinct attributes on each side.
+        // Orientation: the many side probes and keeps its identities; the one side builds and is re-identified, so a
+        // self-join of structurally identical operands has distinct attributes on each side.
         boolean probeRight = match.grouping() == Joining.RIGHT;
         IntermediateResult probe = probeRight ? right : left;
         IntermediateResult build = reidentify(context, probeRight ? left : right);
-        // Layout pin runs inside emitInput *after* PackDims so join-key UnresolvedPromqlLabelRefs resolve into the
-        // collapse before any pin Project (resolveProject does not forward needs - pinning first null-filled keys).
-        List<String> keyLabels = keyLabels();
-        Input probeInput = emitInput(context, new Operand(probe, probeRight ? right() : left()), keyLabels);
-        Input buildInput = emitInput(context, new Operand(build, probeRight ? left() : right()), keyLabels);
+        Input probeInput = emitInput(context, probe, false);
+        Input buildInput = emitInput(context, build, true);
         Expression leftValue = probeRight ? buildInput.valueColumn() : probeInput.valueColumn();
         Expression rightValue = probeRight ? probeInput.valueColumn() : buildInput.valueColumn();
         LogicalPlan join = emitHashJoin(context, probeInput, buildInput);
-        return bindResult(context, leftValue, rightValue, probeInput.step(), join, bindOutput(context, declared));
+        return bindResult(context, leftValue, rightValue, probeInput.step(), join, resultLabels(probeInput.labels(), buildInput.labels()));
+    }
+
+    /**
+     * Prometheus' {@code resultMetric}: the many side's labels, without the metric name for arithmetic and {@code bool},
+     * with only the {@code on(...)} labels or without the {@code ignoring(...)} ones when one-to-one, and with each
+     * {@code group_x} included label written from the one side's. Set operators keep the left series as they are.
+     */
+    private @Nullable Expression resultLabels(@Nullable Expression many, @Nullable Expression one) {
+        if (this instanceof VectorBinarySet) {
+            return many;
+        }
+        Expression labels = many;
+        if (dropMetricName && labels != null) {
+            labels = TranslationContext.unset(labels, List.of(LabelMatcher.NAME));
+        }
+        if (match.grouping() == Joining.NONE && labels != null) {
+            if (match.filter() == VectorMatch.Filter.ON) {
+                labels = TranslationContext.keep(labels, match.filterLabels());
+            } else if (match.filter() == VectorMatch.Filter.IGNORING) {
+                labels = TranslationContext.unset(labels, match.filterLabels());
+            }
+        }
+        for (String included : match.groupingLabels()) {
+            if (labels == null) {
+                labels = VectorBinarySet.emptyLabels(source());
+            }
+            Expression value = one == null ? new Literal(source(), null, DataType.KEYWORD) : TranslationContext.get(one, included);
+            labels = TranslationContext.set(labels, included, value);
+        }
+        return labels;
+    }
+
+    /** The labels two series match on: Prometheus' signature. */
+    private Expression signature(@Nullable Expression labels) {
+        if (labels == null) {
+            return VectorBinarySet.emptyLabels(source());
+        }
+        if (match.filter() == VectorMatch.Filter.ON) {
+            return TranslationContext.keep(labels, match.filterLabels());
+        }
+        var ignored = new LinkedHashSet<String>(match.filterLabels());
+        ignored.add(LabelMatcher.NAME);
+        return TranslationContext.unset(labels, ignored);
     }
 
     /** Whether an operand's pipeline is prone to Eval ghost channels that HashJoin cannot map (#158164). */
@@ -733,35 +778,7 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
             projected.add(attr);
         }
         plan = new Project(cmd.source(), plan, projected);
-        return new IntermediateResult(plan, pinned.toAttribute(), step, input.pendingFilter(), input.kind());
-    }
-
-    /** An operand's translation and the PromQL node it translates. */
-    private record Operand(IntermediateResult result, LogicalPlan node) {}
-
-    /**
-     * The labels both sides pack into the match key, in one shared order: the on(...) labels as written, otherwise the
-     * union of the operands' labels minus the ignored ones and the metric name, sorted by name. A side that lacks a key label packs null
-     * there, so the key behaves like a Prometheus signature: a label absent on both sides does not discriminate, a label
-     * present on one side only never matches. Operands over different label sets therefore evaluate to the empty
-     * vector, and the order in which each operand declares its labels is irrelevant.
-     */
-    private List<String> keyLabels() {
-        if (match.filter() == VectorMatch.Filter.ON) {
-            return List.copyOf(match.filterLabels());
-        }
-        var names = new TreeSet<>(namedLabels(left()));
-        names.addAll(namedLabels(right()));
-        names.removeAll(match.filterLabels());
-        names.remove(LabelMatcher.NAME);
-        return List.copyOf(names);
-    }
-
-    /** The labels an operand names, without its label container. */
-    private static List<String> namedLabels(LogicalPlan operand) {
-        return PromqlLabels.labelNames(
-            operand.output().stream().filter(attribute -> PromqlLabels.isLabelContainer(attribute) == false).toList()
-        );
+        return new IntermediateResult(plan, pinned.toAttribute(), input.labels(), step, input.pendingFilter(), input.kind());
     }
 
     /**
@@ -774,7 +791,7 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
         Expression rightValue,
         Attribute step,
         LogicalPlan join,
-        List<Attribute> output
+        @Nullable Expression labels
     ) {
         PromqlCommand cmd = context.cmd();
         Expression lhsExpr = new ToDouble(leftValue.source(), leftValue);
@@ -789,7 +806,12 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
         // aggregates) resolve it by id, not just by name.
         Alias stepAlias = new Alias(step.source(), step.name(), step, context.stepAttr().id());
         Alias valueAlias = new Alias(source(), cmd.valueColumnName(), value, new NameId());
-        LogicalPlan plan = new Eval(cmd.source(), join, List.of(valueAlias, stepAlias));
+        Alias labelsAlias = labels == null ? null : new Alias(source(), MetadataAttribute.TIMESERIES, labels, new NameId());
+        LogicalPlan plan = new Eval(
+            cmd.source(),
+            join,
+            labelsAlias == null ? List.of(valueAlias, stepAlias) : List.of(valueAlias, stepAlias, labelsAlias)
+        );
         if (filter != null) {
             plan = new Filter(source(), plan, filter);
         }
@@ -797,10 +819,13 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
         Attribute valueAttr = TranslationContext.pinnedAttribute(valueAlias);
         Attribute stepAttr = TranslationContext.pinnedAttribute(stepAlias);
         List<NamedExpression> projected = new ArrayList<>(List.of(valueAttr, stepAttr));
-        projected.addAll(output);
+        Attribute labelsAttr = labelsAlias == null ? null : labelsAlias.toAttribute();
+        if (labelsAttr != null) {
+            projected.add(labelsAttr);
+        }
         plan = new Project(cmd.source(), plan, projected);
 
-        return new IntermediateResult(plan, valueAttr, stepAttr, null, Kind.AFTER_INITIAL_AGGREGATE);
+        return new IntermediateResult(plan, valueAttr, labelsAttr, stepAttr, null, Kind.AFTER_INITIAL_AGGREGATE);
     }
 
     /**
@@ -823,13 +848,14 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
             || input.plan().collect(Aggregate.class).size() > 1) {
             Alias renamedValue = new Alias(input.valueColumn().source(), valueName, input.valueColumn(), new NameId());
             LogicalPlan plan = new Eval(cmd.source(), input.plan(), List.of(renamedValue));
-            return new IntermediateResult(plan, renamedValue.toAttribute(), input.step(), input.pendingFilter(), input.kind());
+            return input.with(plan, renamedValue.toAttribute());
         }
         LogicalPlan plan = input.plan()
             .transformExpressionsDown(Expression.class, e -> reidExpr(renamed(e, cmd.valueColumnName(), valueName), ids));
         Expression value = reidExpr(renamed(input.valueColumn(), cmd.valueColumnName(), valueName), ids);
         Attribute step = (Attribute) reidExpr(input.step(), ids);
-        return new IntermediateResult(plan, value, step, input.pendingFilter(), input.kind());
+        Expression labels = input.labels() == null ? null : input.labels().transformDown(Expression.class, e -> reidExpr(e, ids));
+        return new IntermediateResult(plan, value, labels, step, input.pendingFilter(), input.kind());
     }
 
     /**
@@ -843,7 +869,10 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
         PromqlCommand cmd = context.cmd();
         // The build side carries its join fields plus what the join adds: its value and the group_x labels. Neither can
         // already be a join field (the step, or the freshly packed key), so the two lists are disjoint.
-        List<Attribute> added = addedFields(build.valueColumn());
+        List<Attribute> added = new ArrayList<>(List.of(build.valueColumn()));
+        if (match.groupingLabels().isEmpty() == false && build.labels() != null) {
+            added.add(build.labels());
+        }
         List<NamedExpression> projection = new ArrayList<>(build.fields());
         projection.addAll(added);
         LogicalPlan buildPlan = new Project(cmd.source(), build.plan(), projection);
@@ -876,75 +905,42 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
         );
     }
 
-    /** The columns the join adds from the build side: its value and the labels a group_x modifier copies over. */
-    private List<Attribute> addedFields(Attribute buildValue) {
-        List<Attribute> fields = new ArrayList<>();
-        fields.add(buildValue);
-        for (String name : match.groupingLabels()) {
-            fields.add(UnresolvedPromqlLabelRef.label(source(), name));
-        }
-        return fields;
-    }
-
     /**
-     * One side's plan with its match key packed next to step (step alone when the key is empty), then layout-pinned
-     * when needed. PackDims runs before pin so join-key {@link UnresolvedPromqlLabelRef}s resolve into the collapse;
-     * a pin Project between Aggregate and PackDims would drop those needs ({@code resolveProject} does not forward
-     * them) and HashJoin would see duplicate null keys.
+     * One side's plan with its signature next to step, then layout-pinned when needed. The one side's labels move under a
+     * name of their own, as the join merges its output by name.
      */
-    private Input emitInput(TranslationContext context, Operand operand, List<String> keyLabels) {
+    private Input emitInput(TranslationContext context, IntermediateResult input, boolean oneSide) {
         PromqlCommand cmd = context.cmd();
-        IntermediateResult input = operand.result();
-        List<Attribute> key = joinKey(context, operand.node(), keyLabels);
-        LogicalPlan plan;
-        List<Attribute> fields;
-        if (key.isEmpty()) {
-            plan = input.plan();
-            fields = List.of(input.step());
-        } else {
-            // Prometheus treats an empty label value as absent. label_replace's delete sentinel is {@code ""}, while a
-            // sibling that never had the label packs null - normalize empties to null before PackDims so signatures match.
-            // Only named key labels (keyword) are rewritten; the label container / empty-signature slots stay as-is.
-            LogicalPlan keyed = input.plan();
-            List<Attribute> packKey = new ArrayList<>(key.size());
-            List<Alias> emptyToNull = new ArrayList<>();
-            for (Attribute dim : key) {
-                if (PromqlLabels.isLabelContainer(dim)
-                    || dim.name().equals(EMPTY_SIGNATURE_KEY)
-                    || keyLabels.contains(dim.name()) == false) {
-                    packKey.add(dim);
-                    continue;
-                }
-                Expression absentIfEmpty = new Case(
-                    cmd.source(),
-                    new Equals(cmd.source(), dim, Literal.keyword(cmd.source(), "")),
-                    List.of(Literal.NULL, dim)
-                );
-                // Keep the label name so PackDims dims still read as the PromQL label (plan tests assert by name).
-                Alias norm = new Alias(cmd.source(), dim.name(), absentIfEmpty, new NameId());
-                emptyToNull.add(norm);
-                packKey.add(norm.toAttribute());
-            }
-            if (emptyToNull.isEmpty() == false) {
-                keyed = new Eval(cmd.source(), keyed, emptyToNull);
-            }
-            Attribute packed = new ReferenceAttribute(cmd.source(), null, PackDims.PACKED_FIELD_NAME, DataType.KEYWORD);
-            plan = new PackDims(cmd.source(), keyed, packKey, packed);
-            fields = List.of(input.step(), packed);
+        var evals = new ArrayList<Alias>();
+        // The join keys by the signature as a whole; label pushdown splits it into the columns the join compares.
+        Alias signature = new Alias(cmd.source(), SIGNATURE, signature(input.labels()));
+        evals.add(signature);
+        Attribute labels = null;
+        if (input.labels() instanceof Attribute attribute && oneSide == false) {
+            labels = attribute;
+        } else if (input.labels() != null) {
+            Alias alias = new Alias(cmd.source(), oneSide ? ONE_LABELS : MetadataAttribute.TIMESERIES, input.labels());
+            evals.add(alias);
+            labels = alias.toAttribute();
         }
+        LogicalPlan plan = new Eval(cmd.source(), input.plan(), evals);
+        List<Attribute> fields = List.of(input.step(), signature.toAttribute());
         Attribute step = input.step();
         Attribute value = input.valueColumn();
         if (needsLayoutPin(input)) {
             IntermediateResult pinned = pinOperandLayout(
                 context,
-                new IntermediateResult(plan, value, step, input.pendingFilter(), input.kind())
+                new IntermediateResult(plan, value, labels, step, input.pendingFilter(), input.kind())
             );
             plan = pinned.plan();
             step = pinned.step();
             value = pinned.valueColumn();
             fields = remapJoinFields(fields, plan);
+            if (labels != null) {
+                labels = remapJoinFields(List.of(labels), plan).getFirst();
+            }
         }
-        return new Input(plan, fields, step, value);
+        return new Input(plan, fields, step, value, labels);
     }
 
     /** Resolves join-field attributes against the (possibly pinned) plan output by name and id. */
@@ -964,56 +960,7 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
         return remapped;
     }
 
-    /**
-     * Synthetic join-key slot for a sibling without the label container of an opaque {@code ignoring}/{@code NONE} operand. With typed
-     * {@code _timeseries} it binds to the empty signature, which the opaque side's view equals once every label it does not
-     * leave out sits in a named key slot. Without, bind null-fills it like any absent label; it never equals a packed
-     * label container signature, so the match is empty instead of unique-HashJoin on {@code step} alone ("found a duplicate row")
-     * or asymmetric key arity (IndexOOB).
-     */
-    public static final String EMPTY_SIGNATURE_KEY = "$empty_prom_sig";
-
-    /**
-     * The operand's match key: every label of an opaque operand but the ignored ones as one view, then the shared key
-     * labels, each bound to the operand's own column or to null where it lacks the label.
-     * <p>
-     * Under {@code ignoring}/{@code NONE}, if either operand is opaque both sides pack one signature slot so join-key
-     * arity matches: opaque packs the label container; a side without the label container packs {@link #EMPTY_SIGNATURE_KEY}. With typed
-     * {@code _timeseries} the view also leaves the named key labels out, as they compare in their own slots: a concrete
-     * sibling's labels against the opaque side's, and a promoted label (a prior {@code group_left(l)}) against its
-     * sibling's rather than the stale one the opaque side's label container still holds.
-     */
-    private List<Attribute> joinKey(TranslationContext context, LogicalPlan operand, List<String> keyLabels) {
-        var key = new ArrayList<Attribute>();
-        if (match.filter() != VectorMatch.Filter.ON
-            && (PromqlLabels.labelContainer(left().output()) != null || PromqlLabels.labelContainer(right().output()) != null)) {
-            if (PromqlLabels.labelContainer(operand.output()) != null) {
-                // Start from the operand's tsIdentity (e.g. without(...) already left labels out). Packing only
-                // match-ignored labels would re-expand dropped dimensions and falsely match a labelless aggregate to
-                // a still-labeled sibling (promfuzz-vm 820: max without (job) * sum without (job, instance)).
-                UnresolvedPromqlLabelRef labelContainer = PromqlLabels.labelContainer(operand.output());
-                var ignored = new LinkedHashSet<>(labelContainer.unset());
-                ignored.addAll(match.filterLabels());
-                // A Prometheus signature never includes the metric name unless on(...) lists it.
-                ignored.add(LabelMatcher.NAME);
-                ignored.addAll(keyLabels);
-                key.add(UnresolvedPromqlLabelRef.labelContainer(source(), ignored));
-            } else {
-                key.add(UnresolvedPromqlLabelRef.label(source(), EMPTY_SIGNATURE_KEY));
-            }
-        }
-        for (String name : keyLabels) {
-            key.add(UnresolvedPromqlLabelRef.label(source(), name));
-        }
-        return key;
-    }
-
-    /** Default-match join path: unset __name__ on the label container when dropMetricName (ignoring already did in output()). */
-    private List<Attribute> dropMetricNameFromRest(List<Attribute> declared) {
-        return match.filter() == VectorMatch.Filter.NONE ? withoutMetricName(declared) : declared;
-    }
-
-    /** Prometheus drops __name__ on arith/bool from an opaque label container (requires typed {@code ts_transform}). */
+    /** The declared labels without {@code __name__} for arithmetic and {@code bool}: the command's static schema. */
     private List<Attribute> withoutMetricName(List<Attribute> declared) {
         if (dropMetricName == false) {
             return declared;
@@ -1035,18 +982,6 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
             }
         }
         return result;
-    }
-
-    /**
-     * The join result's label columns: every label the operator declares, read from the operand carrying it - the build
-     * side for the group_x labels, the probe side otherwise - or bound to null.
-     */
-    private List<Attribute> bindOutput(TranslationContext context, List<Attribute> declared) {
-        var output = new ArrayList<Attribute>();
-        for (Attribute attribute : declared) {
-            output.add(UnresolvedPromqlLabelRef.of(source(), attribute));
-        }
-        return output;
     }
 
     /** Renames an attribute or alias in a re-identification pass; other expressions pass through unchanged. */
@@ -1076,22 +1011,21 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
     }
 
     /**
-     * Grain identity for {@link Frame#sharesGrainWith}: label container keys are distinguished by what they leave out
-     * ({@link PromqlLabels#labelContainerName}), not only by the untraced name {@code _timeseries}. Otherwise
-     * {@code max without (job)} and {@code sum without (job, instance)} look like the same grain, fold, and multiply
-     * per leftover label (promfuzz-vm 820).
+     * Whether two collapses key by the same labels besides the step: the same label container expression, so that
+     * {@code max without (job)} and {@code sum without (job, instance)} do not fold (promfuzz-vm 820).
      */
-    private static Set<String> groupingNames(Aggregate aggregate) {
-        Set<String> names = new HashSet<>();
-        for (Expression grouping : aggregate.groupings()) {
-            Expression key = grouping instanceof Alias alias ? alias.child() : grouping;
-            if (key instanceof UnresolvedPromqlLabelRef ref && ref.isLabelContainer()) {
-                names.add(PromqlLabels.labelContainerName(ref.unset()));
-            } else if (grouping instanceof NamedExpression ne) {
-                names.add(ne.name());
+    private static boolean sameLabels(Aggregate left, Aggregate right) {
+        List<Expression> leftKeys = left.groupings().subList(1, left.groupings().size());
+        List<Expression> rightKeys = right.groupings().subList(1, right.groupings().size());
+        if (leftKeys.size() != rightKeys.size()) {
+            return false;
+        }
+        for (int i = 0; i < leftKeys.size(); i++) {
+            if (Alias.unwrap(leftKeys.get(i)).semanticEquals(Alias.unwrap(rightKeys.get(i))) == false) {
+                return false;
             }
         }
-        return names;
+        return true;
     }
 
     /**

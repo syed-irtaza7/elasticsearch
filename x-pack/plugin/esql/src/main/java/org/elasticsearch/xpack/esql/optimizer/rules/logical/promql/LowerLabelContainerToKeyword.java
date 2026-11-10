@@ -81,12 +81,12 @@ public final class LowerLabelContainerToKeyword extends ParameterizedRule<Logica
             return plan;
         }
         return plan.transformUp(node -> switch (node) {
-            case TopNBy top when top.child() instanceof UnionAll union -> {
+            case TopNBy top when top.groupings().stream().anyMatch(g -> g instanceof Attribute key && isMatchKey(key)) -> {
                 List<Expression> groupings = top.groupings()
                     .stream()
-                    .map(grouping -> grouping instanceof Attribute key && isMatchKey(key) ? labelContainerOf(union) : grouping)
+                    .map(grouping -> grouping instanceof Attribute key && isMatchKey(key) ? labelContainerOf(top.child()) : grouping)
                     .toList();
-                yield new TopNBy(top.source(), union, top.order(), top.limitPerGroup(), groupings);
+                yield new TopNBy(top.source(), top.child(), top.order(), top.limitPerGroup(), groupings);
             }
             case UnionAll union -> union.replaceSubPlansAndOutput(
                 union.children(),
@@ -98,7 +98,7 @@ public final class LowerLabelContainerToKeyword extends ParameterizedRule<Logica
         });
     }
 
-    private static Attribute labelContainerOf(UnionAll union) {
+    private static Attribute labelContainerOf(LogicalPlan union) {
         return union.output()
             .stream()
             .filter(column -> isTyped(column) && isMatchKey(column) == false)

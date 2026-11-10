@@ -55,6 +55,7 @@ import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorMatch;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LiteralSelector;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.RangeSelector;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.Selector;
+import org.elasticsearch.xpack.esql.type.EsqlDataTypeConverter;
 
 import java.io.IOException;
 import java.time.Duration;
@@ -510,8 +511,8 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
 
     /**
      * Translates this command into its ES|QL plan: every top-level branch translated, combined, and projected to the
-     * declared {@link #output()}. The plan reads its labels through references ({@link UnresolvedPromqlLabelRef}) that
-     * {@code ResolvePromqlLabelRefs} binds right after.
+     * declared {@link #output()}: each declared label is read off the result's label container, which keeps the rest.
+     * {@code PushDownPromqlLabels} splits the containers into columns right after.
      */
     public LogicalPlan translate(AnalyzerContext analyzer) {
         var context = new TranslationContext(this, analyzer);
@@ -521,7 +522,8 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
         if (plan instanceof VectorBinaryOperator op && (plan instanceof VectorBinarySet) == false) {
             VectorMatch match = op.match();
             if (match.filter() != VectorMatch.Filter.NONE || match.grouping() != VectorMatch.Joining.NONE) {
-                return finish(emitFinalProjection(op.translateAsLeftJoin(context).plan(), false, context), false);
+                IntermediateResult joined = op.translateAsLeftJoin(context);
+                return finish(emitFinalProjection(joined.plan(), joined.labels(), false, context), false);
             }
         }
 
@@ -531,15 +533,15 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
         if (branches.size() == 1) {
             IntermediateResult result = context.translateIntermediate(plan, stepId(), valueId());
             boolean constant = result.kind().constant;
-            return finish(emitFinalProjection(result.plan(), constant, context), constant);
+            return finish(emitFinalProjection(result.plan(), result.labels(), constant, context), constant);
         }
         // Compile every branch as its own module (own step/value ids, own shifted evaluation timestamp), then link.
         LogicalPlan union = VectorBinarySet.translateUnion(
             context,
-            branches,
             branches.stream().map(b -> context.translateIntermediate(b, new NameId(), new NameId())).toList()
         );
-        return finish(emitFinalProjection(union, false, context), false);
+        Attribute labels = union.output().stream().filter(a -> a.name().equals(MetadataAttribute.TIMESERIES)).findFirst().orElseThrow();
+        return finish(emitFinalProjection(union, labels, false, context), false);
     }
 
     /** Keeps only steps within the query range; steps are anchored at {@code start} and offset-independent. */
@@ -565,47 +567,46 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
     }
 
     /**
-     * Projects the command output. Value and step bind to the finished table's columns by name; every label the command
-     * declares, and its {@code _timeseries}, is a reference aliased to its declared name and id. A constant table carries no
-     * labels. Typed {@code _timeseries} stays internal: it binds under an id of its own and the command exposes its keyword
-     * form.
+     * Projects the command output. Value and step bind to the finished table's columns by name. Every label the command
+     * declares reads the result's label container {@code labels}, under its declared name, id and type, and the declared
+     * {@code _timeseries} is the container without them. A constant table carries no labels. Typed {@code _timeseries}
+     * stays internal: it binds under an id of its own and the command exposes its keyword form.
      */
-    private LogicalPlan emitFinalProjection(LogicalPlan plan, boolean constant, TranslationContext context) {
+    private LogicalPlan emitFinalProjection(LogicalPlan plan, @Nullable Expression labels, boolean constant, TranslationContext context) {
         var lookupMap = new HashMap<String, Attribute>();
         for (var attr : plan.output()) {
-            lookupMap.put(attr.name(), attr);
-        }
-        // Under a passthrough mapping the plan carries the concrete field (`labels.job`) while the command declares
-        // the label alone, so fall back to the canonical name. Do not let a BY label named like the sample/step
-        // column steal those lookup keys (by (value) would otherwise bind the value column to the label field).
-        for (var attr : plan.output()) {
-            String finite = PromqlLabels.labelName(attr);
-            if (finite.equals(valueColumnName()) || finite.equals(stepColumnName())) {
-                continue;
-            }
-            lookupMap.putIfAbsent(finite, attr);
+            lookupMap.putIfAbsent(attr.name(), attr);
         }
         var projected = new ArrayList<NamedExpression>(output());
         var evals = new ArrayList<Alias>();
-        List<Attribute> tsIdentity = promqlPlan().output();
+        List<Attribute> declared = promqlPlan().output();
+        List<String> named = PromqlLabels.labelNames(declared.stream().filter(a -> PromqlLabels.isLabelContainer(a) == false).toList());
+        Source source = promqlPlan().source();
         Alias rendered = null;
         for (int i = 0; i < projected.size(); i++) {
             var attr = projected.get(i).toAttribute();
-            // the value and step lead the declared output, then the result's tsIdentity
+            // the value and step lead the declared output, then the result's labels
             if (i >= 2 && constant == false) {
-                var label = UnresolvedPromqlLabelRef.of(promqlPlan().source(), tsIdentity.get(i - 2));
-                if (label.isLabelContainer()) {
-                    Alias labelContainer = new Alias(promqlPlan().source(), attr.name(), label);
+                Attribute label = declared.get(i - 2);
+                if (PromqlLabels.isLabelContainer(label)) {
+                    Expression rest = labels == null ? VectorBinarySet.emptyLabels(source) : TranslationContext.unset(labels, named);
+                    Alias labelContainer = new Alias(source, attr.name(), rest);
+                    evals.add(labelContainer);
                     rendered = new Alias(
-                        promqlPlan().source(),
+                        source,
                         attr.name(),
-                        new ToString(promqlPlan().source(), labelContainer.toAttribute(), context.configuration()),
+                        new ToString(source, labelContainer.toAttribute(), context.configuration()),
                         attr.id()
                     );
-                    projected.set(i, labelContainer);
+                    projected.set(i, labelContainer.toAttribute());
                     continue;
                 }
-                projected.set(i, new Alias(promqlPlan().source(), attr.name(), label, attr.id()));
+                Expression value = labels == null
+                    ? new Literal(source, null, attr.dataType())
+                    : asType(TranslationContext.get(labels, PromqlLabels.labelName(label)), attr.dataType(), context);
+                Alias alias = new Alias(source, attr.name(), value, attr.id());
+                evals.add(alias);
+                projected.set(i, alias.toAttribute());
                 continue;
             }
             var lookupAttr = lookupMap.get(attr.name());
@@ -638,6 +639,14 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
             exposed.add(projection.name().equals(rendered.name()) ? rendered.toAttribute() : projection.toAttribute());
         }
         return new Project(source(), plan, exposed);
+    }
+
+    /** A label's text as the declared label's type: a label read from the container is text, a dimension may not be. */
+    private static Expression asType(Expression text, DataType type, TranslationContext context) {
+        if (type == DataType.KEYWORD || type == DataType.NULL) {
+            return text;
+        }
+        return EsqlDataTypeConverter.converterFunctionFactory(type).apply(text.source(), text, context.configuration());
     }
 
     /** Verifies the PromQL constructs translation supports. */

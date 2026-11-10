@@ -9,8 +9,10 @@ package org.elasticsearch.xpack.esql.plan.logical.promql;
 
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
+import org.elasticsearch.xpack.esql.core.expression.Literal;
 import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
+import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToDouble;
 import org.elasticsearch.xpack.esql.expression.promql.function.FunctionType;
 import org.elasticsearch.xpack.esql.expression.promql.function.PromqlFunctionDefinition;
@@ -65,19 +67,6 @@ public abstract sealed class HistogramFunctionCall extends PromqlFunctionCall pe
         return output;
     }
 
-    /**
-     * The labels the bucket rows of a raw child key by: every label of the child but {@code le} as one view, and
-     * {@code le} itself, so each row is one bucket series.
-     */
-    private List<Attribute> bucketKeys(TranslationContext context) {
-        var keys = new ArrayList<Attribute>();
-        if (PromqlLabels.labelContainer(child().output()) != null) {
-            keys.add(UnresolvedPromqlLabelRef.labelContainer(source(), COLLAPSED_LABELS));
-        }
-        keys.add(UnresolvedPromqlLabelRef.label(source(), LE_LABEL));
-        return keys;
-    }
-
     @Override
     public final FunctionType functionType() {
         return FunctionType.HISTOGRAM;
@@ -92,8 +81,6 @@ public abstract sealed class HistogramFunctionCall extends PromqlFunctionCall pe
 
     @Override
     public IntermediateResult translate(TranslationContext context) {
-        // Classic histogram functions collapse the `le` bucket dimension like a `without (le)` would (see output()), and
-        // read the bucket bound off the `le` column itself (see bucketKeys).
         IntermediateResult result = context.translate(child());
         if (result.kind().constant) {
             return result;
@@ -105,20 +92,27 @@ public abstract sealed class HistogramFunctionCall extends PromqlFunctionCall pe
             return applyValueFunction(context, result);
         }
 
-        // Classic counter-backed histograms evaluate their buckets by `le`. An input without it has a null `le` and evaluates
-        // to nothing; the verifier warns, like Prometheus.
+        // Classic counter-backed histograms evaluate their buckets by `le`: the series collapse as they are, then group by
+        // their labels but `le`, reading each bucket's bound off it. Prometheus drops the metric name from the result.
+        // An input without `le` has a null bound and evaluates to nothing; the verifier warns, like Prometheus.
         if (result.kind().afterInitialAggregation == false) {
-            result = context.emitInitialAggregate(result, bucketKeys(context), result.value());
+            result = context.emitInitialAggregate(result, result.value());
         }
-
         // Bucket counts are consumed as doubles; counter buckets are frequently integer/long typed, so cast explicitly.
         Expression count = new ToDouble(source(), result.value());
-        Attribute le = UnresolvedPromqlLabelRef.label(source(), LE_LABEL);
-        return context.emitAggregate(
+        Expression labels = result.labels();
+        Expression le = labels == null ? new Literal(source(), null, DataType.KEYWORD) : TranslationContext.get(labels, LE_LABEL);
+        IntermediateResult quantiles = context.emitAggregate(
             result,
-            UnresolvedPromqlLabelRef.tsIdentity(source(), output()),
-            true,
+            labels == null ? null : TranslationContext.unset(labels, List.of(LE_LABEL)),
             buildAggregateFunction(count, le)
         );
+        return quantiles.labels() == null ? quantiles : quantiles.withLabels(labels(quantiles.labels()));
+    }
+
+    /** Prometheus drops the metric name from a histogram function's result. */
+    @Override
+    protected Expression labels(Expression input) {
+        return TranslationContext.unset(input, COLLAPSED_LABELS);
     }
 }

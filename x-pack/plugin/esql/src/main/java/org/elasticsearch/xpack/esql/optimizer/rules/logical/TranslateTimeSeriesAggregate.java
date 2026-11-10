@@ -14,6 +14,7 @@ import org.elasticsearch.xpack.esql.analysis.AnalyzerContext;
 import org.elasticsearch.xpack.esql.analysis.AnalyzerRules;
 import org.elasticsearch.xpack.esql.core.expression.Alias;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
+import org.elasticsearch.xpack.esql.core.expression.AttributeSet;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.Expressions;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
@@ -24,6 +25,7 @@ import org.elasticsearch.xpack.esql.core.expression.NameId;
 import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
 import org.elasticsearch.xpack.esql.core.expression.Nullability;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
+import org.elasticsearch.xpack.esql.core.expression.TimeSeriesMetadataAttribute;
 import org.elasticsearch.xpack.esql.core.expression.function.Function;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.core.util.CollectionUtils;
@@ -358,6 +360,11 @@ public final class TranslateTimeSeriesAggregate extends AnalyzerRules.Parameteri
                                     unwrapped.transformUp(Attribute.class, a -> a.semanticEquals(dimension) ? valuesAgg.toAttribute() : a)
                                 );
                                 seriesTransforms.add(transform);
+                                if (transform.dataType() == DataType.TSMD_DATA_TYPE) {
+                                    // A label container is too large to pack: the second pass groups by it as it is.
+                                    secondPassGroupings.add(new Alias(g.source(), g.name(), transform.toAttribute(), g.id()));
+                                    continue;
+                                }
                                 packDimensions.add(transform.toAttribute());
                                 unpackDimensions.add(
                                     new ReferenceAttribute(
@@ -530,7 +537,10 @@ public final class TranslateTimeSeriesAggregate extends AnalyzerRules.Parameteri
         boolean dimension = attribute.isDimension() || (promqlLabel && attribute instanceof FieldAttribute == false);
         var valuesAgg = new Alias(group.source(), group.name(), valuesAggregate(context, attribute, dimension));
         firstPassAggs.add(valuesAgg);
-        if (dimension) {
+        // A label container is too large to pack: the second pass groups by it as it is.
+        boolean labelContainer = promqlLabel
+            && (attribute instanceof TimeSeriesMetadataAttribute || attribute.dataType() == DataType.TSMD_DATA_TYPE);
+        if (dimension && labelContainer == false) {
             packDimensions.add(valuesAgg.toAttribute());
             unpackDimensions.add(
                 new ReferenceAttribute(group.source(), null, group.name(), attribute.dataType(), Nullability.TRUE, group.id(), false)
@@ -652,9 +662,11 @@ public final class TranslateTimeSeriesAggregate extends AnalyzerRules.Parameteri
             if (packDims.child() instanceof TimeSeriesAggregate aggs) {
                 List<NamedExpression> newAggregates = new ArrayList<>();
                 List<Attribute> dims = new ArrayList<>();
+                AttributeSet packed = AttributeSet.of(packDims.dims());
                 for (NamedExpression agg : aggs.aggregates()) {
                     if (agg instanceof Alias alias && alias.child() instanceof AggregateFunction fn) {
-                        if (fn instanceof DimensionValues dv) {
+                        // Only the dimensions PackDims packs: a label container is grouped by as it is.
+                        if (fn instanceof DimensionValues dv && packed.contains(alias.toAttribute())) {
                             // Late dimension extraction reads PackDimsAgg inputs directly from the source. An Eval alias
                             // must instead retain its computed value through DimensionValues and the following PackDims.
                             if (dv.field() instanceof FieldAttribute field && field.isDimension()) {
@@ -667,8 +679,10 @@ public final class TranslateTimeSeriesAggregate extends AnalyzerRules.Parameteri
                         }
                     }
                 }
-                Attribute packed = packDims.packed();
-                newAggregates.add(new Alias(packDims.source(), packed.name(), PackDimsAgg.create(aggs.source(), dims), packed.id()));
+                Attribute packedDims = packDims.packed();
+                newAggregates.add(
+                    new Alias(packDims.source(), packedDims.name(), PackDimsAgg.create(aggs.source(), dims), packedDims.id())
+                );
                 return aggs.with(aggs.child(), aggs.groupings(), mergeExpressions(newAggregates, aggs.groupings()));
             }
             return packDims;

@@ -61,11 +61,11 @@ public final class ScalarConversionFunction extends PromqlFunctionCall {
         IntermediateResult child = context.translate(child());
         if (child.value().foldable()) {
             Expression value = new ToDouble(source(), child.value());
-            return new IntermediateResult(child.plan(), value, child.step(), child.pendingFilter());
+            return new IntermediateResult(child.plan(), value, null, child.step(), child.pendingFilter());
         }
         var scalarExpr = new Scalar(source(), child.value());
         return child.kind().afterInitialAggregation
-            ? context.emitAggregate(child, List.of(), false, scalarExpr)
-            : context.emitInitialAggregate(child, List.of(), scalarExpr);
+            ? context.emitAggregate(child, null, scalarExpr)
+            : context.emitInitialAggregate(child, null, scalarExpr);
     }
 }

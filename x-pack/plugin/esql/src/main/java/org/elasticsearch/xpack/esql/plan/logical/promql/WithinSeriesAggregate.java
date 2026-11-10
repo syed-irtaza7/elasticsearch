@@ -17,6 +17,7 @@ import org.elasticsearch.xpack.esql.expression.promql.function.FunctionType;
 import org.elasticsearch.xpack.esql.expression.promql.function.PromqlFunctionDefinition;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
 
 import java.util.List;
 import java.util.Set;
@@ -87,7 +88,12 @@ public final class WithinSeriesAggregate extends PromqlFunctionCall {
 
     @Override
     public IntermediateResult translate(TranslationContext context) {
-        // Name drop is declared in {@link #output()}; see ValueTransformationFunction.translate.
         return translateValueFunction(context);
+    }
+
+    /** {@code first_over_time}/{@code last_over_time} keep the metric name; other range functions drop it. */
+    @Override
+    protected Expression labels(Expression input) {
+        return keepsMetricName(definition()) ? input : TranslationContext.unset(input, List.of(LabelMatcher.NAME));
     }
 }

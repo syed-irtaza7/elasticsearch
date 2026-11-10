@@ -19,6 +19,7 @@ import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.expression.Order;
 import org.elasticsearch.xpack.esql.expression.function.scalar.conditional.Case;
+import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.ToTimeSeries;
 import org.elasticsearch.xpack.esql.expression.predicate.nulls.IsNotNull;
 import org.elasticsearch.xpack.esql.expression.predicate.nulls.IsNull;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.TemporaryNameGenerator;
@@ -167,7 +168,7 @@ public final class VectorBinarySet extends VectorBinaryOperator {
         for (LogicalPlan branch : branches) {
             intermediateResults.add(context.translateIntermediate(branch, new NameId(), new NameId()));
         }
-        return wrapUnion(context, translateUnion(context, branches, intermediateResults, output()));
+        return wrapUnion(context, translateUnion(context, intermediateResults));
     }
 
     /**
@@ -177,17 +178,14 @@ public final class VectorBinarySet extends VectorBinaryOperator {
         PromqlCommand cmd = context.cmd();
         Attribute value = null;
         Attribute step = null;
-        List<Attribute> labels = new ArrayList<>();
+        Attribute labels = null;
         for (Attribute attr : union.output()) {
-            if (attr.name().equals(cmd.branchColumnName()) || attr.name().equals(OR_MATCH_KEY)) {
-                continue;
-            }
             if (attr.name().equals(cmd.valueColumnName())) {
                 value = attr;
             } else if (attr.name().equals(cmd.stepColumnName())) {
                 step = attr;
-            } else {
-                labels.add(attr);
+            } else if (attr.name().equals(MetadataAttribute.TIMESERIES)) {
+                labels = attr;
             }
         }
         assert value != null && step != null : "union result must expose value and step";
@@ -196,7 +194,7 @@ public final class VectorBinarySet extends VectorBinaryOperator {
         List<NamedExpression> withoutBranch = new ArrayList<>();
         withoutBranch.add(value);
         withoutBranch.add(step);
-        withoutBranch.addAll(labels);
+        withoutBranch.add(labels);
         LogicalPlan plan = new Project(source(), union, withoutBranch);
         String pinName = TemporaryNameGenerator.locallyUniqueTemporaryName(cmd.valueColumnName());
         Alias pinned = new Alias(value.source(), pinName, value, new NameId());
@@ -204,27 +202,17 @@ public final class VectorBinarySet extends VectorBinaryOperator {
         List<NamedExpression> pinnedOut = new ArrayList<>();
         pinnedOut.add(pinned.toAttribute());
         pinnedOut.add(step);
-        pinnedOut.addAll(labels);
+        pinnedOut.add(labels);
         plan = new Project(source(), plan, pinnedOut);
-        return new IntermediateResult(plan, pinned.toAttribute(), step, null, Kind.AFTER_INITIAL_AGGREGATE);
+        return new IntermediateResult(plan, pinned.toAttribute(), labels, step, null, Kind.AFTER_INITIAL_AGGREGATE);
     }
 
     /** Combines independent union branches and keeps the leftmost value for each series and step. */
-    public static LogicalPlan translateUnion(
-        TranslationContext context,
-        List<LogicalPlan> branches,
-        List<IntermediateResult> intermediateResults
-    ) {
-        return translateUnion(context, branches, intermediateResults, unionOutputByName(branches));
-    }
-
-    /** @param tsIdentity series identity (the label container + promoted labels) for left-preferring dedup. */
-    public static LogicalPlan translateUnion(
-        TranslationContext context,
-        List<LogicalPlan> branches,
-        List<IntermediateResult> intermediateResults,
-        List<Attribute> tsIdentity
-    ) {
+    /**
+     * The union of {@code intermediateResults}: each series of a branch whose labels, the metric name left out, no earlier
+     * branch has at the same step - Prometheus' {@code or}.
+     */
+    public static LogicalPlan translateUnion(TranslationContext context, List<IntermediateResult> intermediateResults) {
         PromqlCommand cmd = context.cmd();
         // Already validated against max_branch_count_per_merge by PromqlCommand.verify.
         int maxBranches = context.analyzer().maxBranchCountPerMerge();
@@ -241,85 +229,41 @@ public final class VectorBinarySet extends VectorBinaryOperator {
             // Absent left must not shadow a present right (rate or irate fallback).
             var ir = intermediateResults.get(i);
             LogicalPlan branchPlan = PromqlCommand.emitNullsFilter(source, ir.plan(), ir.valueColumn());
-            var branchTagExpression = new Alias(source, cmd.branchColumnName(), new Literal(source, i, DataType.INTEGER));
-            var nullLabelEvals = new ArrayList<Alias>();
+            var branch = new Alias(source, cmd.branchColumnName(), new Literal(source, i, DataType.INTEGER));
+            var labels = new Alias(source, MetadataAttribute.TIMESERIES, ir.labels() != null ? ir.labels() : emptyLabels(source));
+            var match = new Alias(source, OR_MATCH_KEY, TranslationContext.unset(labels.toAttribute(), List.of(LabelMatcher.NAME)));
+            LogicalPlan tagged = new Eval(source, branchPlan, List.of(branch, labels, match));
             // Pin layout across the exchange (#158164): Eval name-shadow leaves ghost channels otherwise.
-            var projections = new ArrayList<NamedExpression>(List.of(ir.valueColumn(), ir.step()));
-            if (ir.kind().constant == false) {
-                // A separate match key unsets __name__ (Prometheus set-op identity).
-                UnresolvedPromqlLabelRef branchLabelContainer = PromqlLabels.labelContainer(branches.get(i).output());
-                for (Attribute label : tsIdentity) {
-                    if (PromqlLabels.isLabelContainer(label)) {
-                        UnresolvedPromqlLabelRef pack = branchLabelContainer != null
-                            ? UnresolvedPromqlLabelRef.labelContainer(source, branchLabelContainer.unset())
-                            : UnresolvedPromqlLabelRef.of(source, label);
-                        projections.add(new Alias(source, MetadataAttribute.TIMESERIES, pack, label.id()));
-                        Set<String> matchUnset = new LinkedHashSet<>();
-                        if (branchLabelContainer != null) {
-                            matchUnset.addAll(branchLabelContainer.unset());
-                        }
-                        matchUnset.add(LabelMatcher.NAME);
-                        projections.add(new Alias(source, OR_MATCH_KEY, UnresolvedPromqlLabelRef.labelContainer(source, matchUnset)));
-                    } else {
-                        // Null-fill undeclared labels: resolving them would invent by-keys (empty max by (cluster) or vector(0)).
-                        String labelName = PromqlLabels.labelName(label);
-                        boolean declared = PromqlLabels.getLabel(
-                            branches.get(i).output().stream().filter(a -> PromqlLabels.isLabelContainer(a) == false).toList(),
-                            labelName
-                        ) != null;
-                        if (declared) {
-                            projections.add(UnresolvedPromqlLabelRef.of(source, label));
-                        } else {
-                            Alias nullLabel = new Alias(source, label.name(), new Literal(source, null, label.dataType()), new NameId());
-                            nullLabelEvals.add(nullLabel);
-                            projections.add(nullLabel.toAttribute());
-                        }
-                    }
-                }
-            }
-            projections.add(branchTagExpression.toAttribute());
-            var evals = new ArrayList<Alias>();
-            evals.add(branchTagExpression);
-            evals.addAll(nullLabelEvals);
-            LogicalPlan tagged = new Eval(source, branchPlan, evals);
-            branchPlans.add(new Project(source, tagged, projections));
+            branchPlans.add(
+                new Project(
+                    source,
+                    tagged,
+                    List.of(ir.valueColumn(), ir.step(), labels.toAttribute(), match.toAttribute(), branch.toAttribute())
+                )
+            );
         }
 
-        // UnionAll recomputes output by name; ids from the first branch stay valid for TopNBy groupings.
-        List<Attribute> unionOutput = VectorBinarySet.unionOutputByName(branchPlans);
+        // Every branch projects the same columns; the union outputs the first branch's.
+        List<Attribute> unionOutput = branchPlans.getFirst().output();
         var union = new UnionAll(source, branchPlans, unionOutput);
+        Attribute step = attribute(unionOutput, cmd.stepColumnName());
+        Attribute match = attribute(unionOutput, OR_MATCH_KEY);
+        var order = new Order(source, attribute(unionOutput, cmd.branchColumnName()), Order.OrderDirection.ASC, Order.NullsPosition.LAST);
+        return new TopNBy(source, union, List.of(order), new Literal(source, 1, DataType.INTEGER), List.of(step, match));
+    }
 
-        var groupings = new ArrayList<Expression>();
-        Attribute branchAttr = null;
-        Attribute orMatchKey = null;
-        Attribute labelContainerAttr = null;
-        for (Attribute attr : unionOutput) {
-            if (attr.name().equals(cmd.branchColumnName())) {
-                branchAttr = attr;
-            } else if (attr.name().equals(cmd.stepColumnName())) {
-                groupings.add(attr);
-            } else if (attr.name().equals(OR_MATCH_KEY)) {
-                orMatchKey = attr;
-            } else if (PromqlLabels.isLabelContainer(attr)
-                || MetadataAttribute.TIMESERIES.equals(attr.name())
-                || attr.name().startsWith(MetadataAttribute.TIMESERIES + "$")) {
-                    // Alias.toAttribute of packed label container is UnresolvedAttribute named _timeseries - still tsIdentity.
-                    labelContainerAttr = attr;
-                }
-        }
-        // Prefer $_or_match when present; else the label container (full blob, no __name__ drop).
-        if (orMatchKey != null) {
-            groupings.add(orMatchKey);
-        } else if (labelContainerAttr != null) {
-            groupings.add(labelContainerAttr);
-        }
-        for (Attribute label : tsIdentity) {
-            if (PromqlLabels.isLabelContainer(label) == false) {
-                groupings.add(UnresolvedPromqlLabelRef.of(source, label));
+    /** The labels of a vector without labels. */
+    public static Expression emptyLabels(Source source) {
+        return new ToTimeSeries(source, Literal.keyword(source, "{}"));
+    }
+
+    private static Attribute attribute(List<Attribute> output, String name) {
+        for (Attribute attribute : output) {
+            if (attribute.name().equals(name)) {
+                return attribute;
             }
         }
-        var order = new Order(source, branchAttr, Order.OrderDirection.ASC, Order.NullsPosition.LAST);
-        return new TopNBy(source, union, List.of(order), new Literal(source, 1, DataType.INTEGER), groupings);
+        throw new IllegalStateException("union result must expose [" + name + "]");
     }
 
     /** Left-to-right limbs of a default-matching or chain. */

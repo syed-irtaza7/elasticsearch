@@ -14,19 +14,30 @@ import org.elasticsearch.xpack.esql.core.expression.Alias;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.Literal;
+import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
 import org.elasticsearch.xpack.esql.core.expression.NameId;
 import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
 import org.elasticsearch.xpack.esql.core.expression.Nullability;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.core.util.Holder;
 import org.elasticsearch.xpack.esql.expression.function.aggregate.AbsentOverTime;
+import org.elasticsearch.xpack.esql.expression.function.aggregate.AggregateFunction;
 import org.elasticsearch.xpack.esql.expression.function.aggregate.CountOverTime;
 import org.elasticsearch.xpack.esql.expression.function.aggregate.PresentOverTime;
+import org.elasticsearch.xpack.esql.expression.function.aggregate.TimeSeriesAggregateFunction;
+import org.elasticsearch.xpack.esql.expression.function.aggregate.Values;
 import org.elasticsearch.xpack.esql.expression.function.grouping.TStep;
+import org.elasticsearch.xpack.esql.expression.function.grouping.TimeSeriesWithout;
 import org.elasticsearch.xpack.esql.expression.function.scalar.conditional.Case;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToDatetime;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToDouble;
+import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.TimeSeriesKeep;
+import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.TimeSeriesPath;
+import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.TimeSeriesSet;
+import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.TimeSeriesTransform;
+import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.ToTimeSeries;
 import org.elasticsearch.xpack.esql.expression.predicate.logical.And;
 import org.elasticsearch.xpack.esql.expression.predicate.logical.Not;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.arithmetic.Add;
@@ -40,16 +51,13 @@ import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
 import org.elasticsearch.xpack.esql.plan.logical.Eval;
 import org.elasticsearch.xpack.esql.plan.logical.Filter;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
-import org.elasticsearch.xpack.esql.plan.logical.PackDims;
-import org.elasticsearch.xpack.esql.plan.logical.Project;
 import org.elasticsearch.xpack.esql.plan.logical.TimeSeriesAggregate;
-import org.elasticsearch.xpack.esql.plan.logical.UnpackDims;
 import org.elasticsearch.xpack.esql.plan.logical.join.HashJoin;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult.Kind;
 import org.elasticsearch.xpack.esql.session.Configuration;
 
-import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -58,10 +66,11 @@ import java.util.function.Function;
 import static org.elasticsearch.xpack.esql.expression.predicate.Predicates.combineAndNullable;
 
 /**
- * Shared state and assembly helpers for one PromQL translation. Translators read the labels of their input through
- * references ({@link UnresolvedPromqlLabelRef}) and never look at which columns their input carries:
- * {@code ResolvePromqlLabelRefs} binds the references right after translation. This context also preserves aggregation
- * boundaries and assembles the command output.
+ * Shared state and assembly helpers for one PromQL translation. Every result carries its series' labels as one label
+ * container ({@link IntermediateResult#labels}): translators state what they do to labels as calls over it
+ * ({@code ts_unset}, {@code ts_keep}, {@code ts_set}, {@code ts_path}) and never decide which labels become columns, which
+ * a pushdown rule does after translation. This context also preserves aggregation boundaries and assembles the command
+ * output.
  */
 public record TranslationContext(
     PromqlCommand cmd,
@@ -93,6 +102,35 @@ public record TranslationContext(
 
     public Attribute stepAttr() {
         return stepBucketAlias != null ? stepBucketAlias.toAttribute() : cmd.stepAttribute();
+    }
+
+    /** The labels of a series read from the source: its whole label container. */
+    public static Expression sourceLabels(Source source) {
+        return new ToTimeSeries(source, new TimeSeriesWithout(source));
+    }
+
+    /** {@code labels} without {@code names}. */
+    public static Expression unset(Expression labels, Collection<String> names) {
+        return new TimeSeriesTransform(labels.source(), labels, literals(labels.source(), names));
+    }
+
+    /** {@code labels} with only {@code names}. */
+    public static Expression keep(Expression labels, Collection<String> names) {
+        return new TimeSeriesKeep(labels.source(), labels, literals(labels.source(), names));
+    }
+
+    /** {@code labels} with {@code name} written as {@code value}; a missing or empty value removes it. */
+    public static Expression set(Expression labels, String name, Expression value) {
+        return new TimeSeriesSet(labels.source(), labels, Literal.keyword(labels.source(), name), value);
+    }
+
+    /** The value of {@code name} in {@code labels}, null when absent. */
+    public static Expression get(Expression labels, String name) {
+        return new TimeSeriesPath(labels.source(), labels, Literal.keyword(labels.source(), name));
+    }
+
+    private static List<Expression> literals(Source source, Collection<String> names) {
+        return names.stream().<Expression>map(name -> Literal.keyword(source, name)).toList();
     }
 
     /** Translates an independent branch with its own value and step identities. */
@@ -143,9 +181,10 @@ public record TranslationContext(
         };
         LogicalPlan plan = ir.plan().transformExpressionsDown(Expression.class, rekey);
         Expression value = ir.value().transformDown(Expression.class, rekey);
+        Expression labels = ir.labels() == null ? null : ir.labels().transformDown(Expression.class, rekey);
         Attribute step = (Attribute) rekey.apply(ir.step());
         Expression filter = ir.pendingFilter() == null ? null : ir.pendingFilter().transformDown(Expression.class, rekey);
-        return new IntermediateResult(plan, value, step, filter, ir.kind());
+        return new IntermediateResult(plan, value, labels, step, filter, ir.kind());
     }
 
     /**
@@ -161,62 +200,85 @@ public record TranslationContext(
     }
 
     /**
-     * The initial aggregate: a raw table collapsed to one row per step by the innermost {@link TimeSeriesAggregate},
-     * {@code function} applied in it. Passing the table's own value collapses it as is; the result keys by what its
-     * consumers read.
+     * The initial aggregate: a raw table collapsed to one row per step and series by the innermost
+     * {@link TimeSeriesAggregate}, {@code function} applied in it. Passing the table's own value collapses it as is.
      */
     public IntermediateResult emitInitialAggregate(IntermediateResult input, Expression function) {
-        return emitInitialAggregate(input, List.of(), function);
+        Expression labels = input.labels();
+        Expression series = labels == null
+            ? null
+            : labels.collectFirstChildren(e -> e instanceof ToTimeSeries t && t.field() instanceof TimeSeriesWithout)
+                .stream()
+                .findFirst()
+                .orElse(null);
+        if (series == null) {
+            return emitInitialAggregate(input, labels, function);
+        }
+        // One row per series: the source labels are its identity, so a function over its samples is one value per group. The
+        // changes made to the labels so far then apply to the collapsed series.
+        IntermediateResult collapsed = emitInitialAggregate(input, series, perSeries(function));
+        Expression key = collapsed.labels();
+        return collapsed.withLabels(labels.transformUp(Expression.class, e -> e.semanticEquals(series) ? key : e));
     }
 
-    /** The initial aggregate keyed by {@code keys}, references to the labels it groups by. */
-    public IntermediateResult emitInitialAggregate(IntermediateResult input, List<Attribute> keys, Expression function) {
+    /** A bare per-series function over a collapse keyed by series: one value per group, which {@code VALUES} reads. */
+    private static Expression perSeries(Expression function) {
+        Holder<Boolean> bare = new Holder<>(false);
+        function.forEachDownMayReturnEarly((e, exit) -> {
+            if (e instanceof TimeSeriesAggregateFunction) {
+                bare.set(true);
+                exit.set(true);
+            } else if (e instanceof AggregateFunction) {
+                exit.set(true);
+            }
+        });
+        return bare.get() ? new Values(function.source(), function) : function;
+    }
+
+    /** The initial aggregate keyed by {@code labels}, the label container of each result series; null keys by step alone. */
+    public IntermediateResult emitInitialAggregate(IntermediateResult input, @Nullable Expression labels, Expression function) {
         assert input.kind().afterInitialAggregation == false : "invariant: a collapse takes a raw table";
         Alias value = new Alias(function.source(), cmd.valueColumnName(), function);
+        Alias key = labelsKey(labels);
         LogicalPlan plan = new TimeSeriesAggregate(
             cmd.promqlPlan().source(),
             input.plan(),
-            groupings(stepBucketAlias, keys),
-            aggregates(value, input.step(), keys),
+            groupings(stepBucketAlias, key),
+            aggregates(value, input.step(), key),
             null,
             time,
             TimeSeriesAggregate.Origin.PROMQL_COMMAND,
             false
         );
-        return new IntermediateResult(plan, value.toAttribute(), input.step(), input.pendingFilter(), Kind.AFTER_INITIAL_AGGREGATE);
+        return new IntermediateResult(
+            plan,
+            value.toAttribute(),
+            key == null ? null : key.toAttribute(),
+            input.step(),
+            input.pendingFilter(),
+            Kind.AFTER_INITIAL_AGGREGATE
+        );
     }
 
-    /**
-     * Regroups a collapsed table by {@code keys}, references to the labels it groups by. The emitAggregate packs its dimensions first
-     * when it keys by a {@code ts_metadata} view or the operator asks for it ({@code packDimensions}).
-     */
-    public IntermediateResult emitAggregate(IntermediateResult input, List<Attribute> keys, boolean packDimensions, Expression function) {
+    /** Regroups a collapsed table by {@code labels}, the label container of each result series; null groups by step alone. */
+    public IntermediateResult emitAggregate(IntermediateResult input, @Nullable Expression labels, Expression function) {
         assert input.kind().afterInitialAggregation : "invariant: a emitAggregate takes a collapsed table";
         Alias value = new Alias(function.source(), cmd.valueColumnName(), function);
-        boolean pack = packDimensions
-            || keys.stream().anyMatch(key -> key instanceof UnresolvedPromqlLabelRef ref && ref.isLabelContainer());
-        LogicalPlan plan;
-        Source source = cmd.source();
+        Alias key = labelsKey(labels);
         Attribute step = input.step();
-        LogicalPlan plan1 = input.plan();
-        if (pack == false || keys.isEmpty()) {
-            plan = new Aggregate(source, plan1, groupings(step, keys), aggregates(value, step, keys));
-        } else {// TranslateTimeSeriesAggregate unpacks the inner TSA's dimensions and this emitAggregate re-packs them.
-            Attribute packedAttribute = PackDims.newPackedAttribute(source);
-            PackDims packDims = new PackDims(source, plan1, keys, packedAttribute);
-            Alias packedGrouping = PackDims.newPackedGrouping(source, packedAttribute);
-            Aggregate agg = new Aggregate(
-                source,
-                packDims,
-                groupings(step, List.of(packedGrouping)),
-                aggregates(value, step, List.of(packedGrouping.toAttribute()))
-            );// The unpacked dimensions are the keys; ResolvePromqlLabelRefs lays them out once they are bound.
-            UnpackDims unpackDims = new UnpackDims(source, agg, packedGrouping.toAttribute(), keys);
-            List<NamedExpression> projections = new ArrayList<>(List.of(value.toAttribute(), step));
-            projections.addAll(keys);
-            plan = new Project(source, unpackDims, projections);
-        }
-        return new IntermediateResult(plan, value.toAttribute(), input.step(), input.pendingFilter(), Kind.AFTER_INITIAL_AGGREGATE);
+        LogicalPlan plan = new Aggregate(cmd.source(), input.plan(), groupings(step, key), aggregates(value, step, key));
+        return new IntermediateResult(
+            plan,
+            value.toAttribute(),
+            key == null ? null : key.toAttribute(),
+            step,
+            input.pendingFilter(),
+            Kind.AFTER_INITIAL_AGGREGATE
+        );
+    }
+
+    private @Nullable Alias labelsKey(@Nullable Expression labels) {
+        return labels == null ? null : new Alias(labels.source(), MetadataAttribute.TIMESERIES, labels);
     }
 
     /**
@@ -286,19 +348,12 @@ public record TranslationContext(
         return true;
     }
 
-    private static List<Expression> groupings(Expression step, List<? extends NamedExpression> keys) {
-        var groupings = new ArrayList<Expression>(keys.size() + 1);
-        groupings.add(step);
-        groupings.addAll(keys);
-        return groupings;
+    private static List<Expression> groupings(Expression step, @Nullable Alias key) {
+        return key == null ? List.of(step) : List.of(step, key);
     }
 
-    private static List<NamedExpression> aggregates(NamedExpression value, Attribute step, List<? extends NamedExpression> keys) {
-        var aggregates = new ArrayList<NamedExpression>(keys.size() + 2);
-        aggregates.add(value);
-        aggregates.add(step);
-        aggregates.addAll(keys);
-        return aggregates;
+    private static List<NamedExpression> aggregates(NamedExpression value, Attribute step, @Nullable Alias key) {
+        return key == null ? List.of(value, step) : List.of(value, step, key.toAttribute());
     }
 
     /** Finishes a branch after its operands have contributed their deferred source predicates. */
@@ -338,7 +393,7 @@ public record TranslationContext(
 
         Kind kind = ir.kind().constant ? ir.kind() : Kind.AFTER_INITIAL_AGGREGATE;
         // Same pin as bindResult: unresolved toAttribute freezes in Projects.
-        return new IntermediateResult(plan, pinnedAttribute(valueAlias), ir.step(), null, kind);
+        return new IntermediateResult(plan, pinnedAttribute(valueAlias), ir.labels(), ir.step(), null, kind);
     }
 
     /** Same id as alias while unresolved - Projects must not freeze a toAttribute snapshot. */
@@ -360,7 +415,7 @@ public record TranslationContext(
         var plan = PromqlLogicalPlanBuilder.buildLocalRelation(cmd);
         var step = plan.output().getFirst();
         var value = result.value().transformUp(Attribute.class, attr -> attr.semanticEquals(stepAttr) ? step : attr);
-        return new IntermediateResult(plan, value, step, result.pendingFilter(), Kind.CONSTANT);
+        return new IntermediateResult(plan, value, null, step, result.pendingFilter(), Kind.CONSTANT);
     }
 
     /** Defines the offset-adjusted evaluation timestamp at the source. */
@@ -397,6 +452,8 @@ public record TranslationContext(
         LogicalPlan plan,
         /* A sample expression until initial aggregation materializes it as a column. */
         Expression value,
+        /* The series' label container, composed like the value until an aggregate keys by it; null for no labels. */
+        @Nullable Expression labels,
         Attribute step,
         /* Deferred source predicates can be fused into the operand's aggregate functions. */
         Expression pendingFilter,
@@ -419,19 +476,19 @@ public record TranslationContext(
             }
         }
 
-        /** A raw input whose value may still contain per-series aggregate expressions. */
-        public IntermediateResult(LogicalPlan plan, Expression value, Attribute step) {
-            this(plan, value, step, null, Kind.BEFORE_INITIAL_AGGREGATE);
-        }
-
         /** A raw input carrying a selector predicate until source filtering or aggregate assembly consumes it. */
-        public IntermediateResult(LogicalPlan plan, Expression value, Attribute step, Expression selectorFilter) {
-            this(plan, value, step, selectorFilter, Kind.BEFORE_INITIAL_AGGREGATE);
+        public IntermediateResult(LogicalPlan plan, Expression value, Expression labels, Attribute step, Expression selectorFilter) {
+            this(plan, value, labels, step, selectorFilter, Kind.BEFORE_INITIAL_AGGREGATE);
         }
 
         /** This result rebuilt around a new plan and value, keeping its other properties. */
         public IntermediateResult with(LogicalPlan plan, Expression value) {
-            return new IntermediateResult(plan, value, step, pendingFilter, kind);
+            return new IntermediateResult(plan, value, labels, step, pendingFilter, kind);
+        }
+
+        /** This result with its series' labels changed: {@code labels} are calls over the current ones. */
+        public IntermediateResult withLabels(@Nullable Expression labels) {
+            return new IntermediateResult(plan, value, labels, step, pendingFilter, kind);
         }
 
         /** The value as a defined column; only valid on a finished table. */

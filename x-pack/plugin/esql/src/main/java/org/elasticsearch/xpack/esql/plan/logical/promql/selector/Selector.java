@@ -125,8 +125,8 @@ public abstract sealed class Selector extends UnaryPlan implements PromqlPlan pe
                 List.of(context.cmd().valueAttribute(), context.cmd().stepAttribute()),
                 EmptyLocalSupplier.EMPTY
             );
-            return new IntermediateResult(empty, Literal.NULL, context.cmd().stepAttribute(), null, Kind.CONSTANT);
+            return new IntermediateResult(empty, Literal.NULL, null, context.cmd().stepAttribute(), null, Kind.CONSTANT);
         }
-        return new IntermediateResult(input, value, context.stepAttr(), matcher);
+        return new IntermediateResult(input, value, TranslationContext.sourceLabels(source()), context.stepAttr(), matcher);
     }
 }

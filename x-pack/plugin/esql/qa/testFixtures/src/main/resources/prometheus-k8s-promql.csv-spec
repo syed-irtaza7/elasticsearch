@@ -2173,6 +2173,34 @@ result:double | step:datetime            | pod:keyword
 9969.0        | 2024-05-10T01:00:00.000Z | three
 ;
 
+// topk over an aggregate without labels: the aggregate already holds one series per step.
+topk_over_sum_without_labels
+required_capability: promql_command_v0
+required_capability: promql_topk
+required_capability: fix_promql_topk_over_unlabeled_aggregate
+required_capability: fix_promql_time_bucket_v2
+required_capability: fix_ts_block_loader_passthrough_aliasing
+PROMQL index=prometheus-k8s step=1h result=(topk(1, sum(network.total_bytes_in{cluster="prod"})))
+| SORT result DESC;
+
+result:double | step:datetime
+21193.0       | 2024-05-10T01:00:00.000Z
+;
+
+// topk over quantile(0.9) of 947, 9969 and 10277: 9969 + 0.8 * (10277 - 9969).
+topk_over_quantile
+required_capability: promql_command_v0
+required_capability: promql_topk
+required_capability: fix_promql_topk_over_unlabeled_aggregate
+required_capability: fix_promql_time_bucket_v2
+required_capability: fix_ts_block_loader_passthrough_aliasing
+PROMQL index=prometheus-k8s step=1h result=(topk(1, quantile(0.9, network.total_bytes_in{cluster="prod"})))
+| SORT result DESC;
+
+result:double | step:datetime
+10215.4       | 2024-05-10T01:00:00.000Z
+;
+
 // bottomk mirrors topk but keeps the k series with the lowest values.
 bottomk_bare
 required_capability: promql_command_v0

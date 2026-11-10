@@ -72,10 +72,9 @@ public final class SortFunction extends PromqlFunctionCall implements ResultOrde
             var skipAllFilter = new Filter(source(), result.plan(), Literal.FALSE);
             var nullGrouping = new Values(source(), new Literal(source(), null, DataType.DOUBLE));
             IntermediateResult skipped = result.with(skipAllFilter, result.value());
-            List<Attribute> keys = UnresolvedPromqlLabelRef.tsIdentity(source(), child().output());
             return skipped.kind().afterInitialAggregation
-                ? context.emitAggregate(skipped, keys, false, nullGrouping)
-                : context.emitInitialAggregate(skipped, keys, nullGrouping);
+                ? context.emitAggregate(skipped, skipped.labels(), nullGrouping)
+                : context.emitInitialAggregate(skipped, skipped.labels(), nullGrouping);
         }
         return result;
     }
