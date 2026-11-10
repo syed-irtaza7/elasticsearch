@@ -2760,10 +2760,10 @@ public class EsqlCapabilities {
 
         /**
          * Typed label container: PromQL carries {@code _timeseries} internally as a typed column, which the PromQL
-         * shapes that modify it rely on; the user always gets the keyword form. Also the release gate for that behavior.
-         * Disabled until PromQL uses the typed column end to end.
+         * shapes that modify it rely on; the user always gets the keyword form. Snapshot-only like the type itself, which is
+         * under construction; also the release gate for that behavior.
          */
-        ENABLE_TSMD_DATA_TYPE(false),
+        ENABLE_TSMD_DATA_TYPE(Build.current().isSnapshot()),
 
         /**
          * Corrected output shape for PromQL {@code without}: a {@code without} over a concrete-output child (e.g.
